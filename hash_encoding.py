@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import pdb
 
-from utils import get_voxel_vertices
+from utils import get_voxel_vertices, get_plane_vertices
 
 class HashEmbedder(nn.Module):
     def __init__(self, bounding_box, n_levels=16, n_features_per_level=2,\
@@ -71,6 +71,151 @@ class HashEmbedder(nn.Module):
 
         return torch.cat(x_embedded_all, dim=-1)
 
+class HashTriEmbedder(nn.Module):
+    def __init__(self, bounding_box, n_levels=16, n_features_per_level=2,\
+                log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
+        super(HashTriEmbedder, self).__init__()
+        self.bounding_box = bounding_box
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.log2_hashmap_size = log2_hashmap_size
+        self.base_resolution = torch.tensor(base_resolution)
+        self.finest_resolution = torch.tensor(finest_resolution)
+        self.out_dim = self.n_levels * self.n_features_per_level * 3
+
+        self.b = torch.exp((torch.log(self.finest_resolution)-torch.log(self.base_resolution))/(n_levels-1))
+
+        #self.embeddings = [None]*3
+        #for i in range(3):
+        #    self.embeddings[i] = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
+        #                                    self.n_features_per_level) for i in range(n_levels)] )
+        self.embeddings_xy = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
+                                            self.n_features_per_level) for i in range(n_levels)] )
+        self.embeddings_xz = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
+                                            self.n_features_per_level) for i in range(n_levels)] )
+        self.embeddings_yz = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
+                                            self.n_features_per_level) for i in range(n_levels)] )
+        self.embeddings = [self.embeddings_xy, self.embeddings_xz, self.embeddings_yz]
+
+        # custom uniform initialization
+        for i0 in range(3):
+            for i1 in range(n_levels):
+                nn.init.uniform_(self.embeddings[i0][i1].weight, a=-0.0001, b=0.0001)
+            # self.embeddings[i].weight.data.zero_()
+
+    def bilinear_interp(self, x, voxel_min_vertex, voxel_max_vertex, voxel_embedds):
+        '''
+        x: B x 2
+        voxel_min_vertex: B x 2
+        voxel_max_vertex: B x 2
+        voxel_embedds: B x 4 x 2
+        '''
+        # source: https://en.wikipedia.org/wiki/Trilinear_interpolation
+        weights = (x - voxel_min_vertex)/(voxel_max_vertex-voxel_min_vertex) # B x 2
+
+        # step 1
+        # 0->00, 1->01, 2->10, 4->11
+        c0 = voxel_embedds[:,0]*(1-weights[:,0][:,None]) + voxel_embedds[:,2]*weights[:,0][:,None]
+        c1 = voxel_embedds[:,1]*(1-weights[:,0][:,None]) + voxel_embedds[:,3]*weights[:,0][:,None]
+
+        # step 3
+        c = c0*(1-weights[:,1][:,None]) + c1*weights[:,1][:,None]
+
+        return c
+    
+    def separate_input(self,x):
+        in_xy = x[:,:2]
+        in_xz = x[:,::2]
+        in_yz = x[:,-2:]
+        return [in_xy,in_xz,in_yz]
+
+
+    def forward(self, x):
+        # x is 3D point position: B x 3
+        x_sep = self.separate_input(x)
+        x_embedded_all = []
+        for i in range(self.n_levels):  #16
+            resolution = torch.floor(self.base_resolution * self.b**i)
+            voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices = get_plane_vertices(\
+                                                x, self.bounding_box, \
+                                                resolution, self.log2_hashmap_size) #[3*(B, 2)]  [3*(B, 2)]  [3*(B, 4)]
+            
+            for j in range(3):
+                voxel_embedds = self.embeddings[j][i](hashed_voxel_indices[j])     # (B, 4, 2)
+                x_embedded = self.bilinear_interp(x_sep[j], voxel_min_vertex[j], voxel_max_vertex[j], voxel_embedds)
+                # (B, 2)
+                x_embedded_all.append(x_embedded)
+
+            #pdb.set_trace()
+        return torch.cat(x_embedded_all, dim=-1)
+
+class TriEmbedder(nn.Module):
+    def __init__(self, bounding_box, n_levels=16, n_features_per_level=16,\
+                log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
+        super(TriEmbedder, self).__init__()
+        self.bounding_box = bounding_box
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.log2_hashmap_size = log2_hashmap_size
+        self.base_resolution = torch.tensor(base_resolution)
+        self.finest_resolution = torch.tensor(finest_resolution)
+        self.out_dim = self.n_levels * self.n_features_per_level * 3 
+
+        self.embeddings_xy = nn.Embedding(self.finest_resolution**2, self.n_features_per_level)
+        self.embeddings_xz = nn.Embedding(self.finest_resolution**2, self.n_features_per_level) 
+        self.embeddings_yz = nn.Embedding(self.finest_resolution**2, self.n_features_per_level)
+        self.embeddings = nn.ModuleList([self.embeddings_xy, self.embeddings_xz, self.embeddings_yz])
+
+        # custom uniform initialization
+        for i0 in range(3):
+            nn.init.uniform_(self.embeddings[i0].weight, a=-0.0001, b=0.0001)
+            # self.embeddings[i].weight.data.zero_()
+
+    def bilinear_interp(self, x, voxel_min_vertex, voxel_max_vertex, voxel_embedds):
+        '''
+        x: B x 2
+        voxel_min_vertex: B x 2
+        voxel_max_vertex: B x 2
+        voxel_embedds: B x 4 x 2
+        '''
+        # source: https://en.wikipedia.org/wiki/Trilinear_interpolation
+        weights = (x - voxel_min_vertex)/(voxel_max_vertex-voxel_min_vertex) # B x 2
+
+        # step 1
+        # 0->00, 1->01, 2->10, 4->11
+        c0 = voxel_embedds[:,0]*(1-weights[:,0][:,None]) + voxel_embedds[:,2]*weights[:,0][:,None]
+        c1 = voxel_embedds[:,1]*(1-weights[:,0][:,None]) + voxel_embedds[:,3]*weights[:,0][:,None]
+
+        # step 3
+        c = c0*(1-weights[:,1][:,None]) + c1*weights[:,1][:,None]
+
+        return c
+    
+    def separate_input(self,x):
+        in_xy = x[:,:2]
+        in_xz = x[:,::2]
+        in_yz = x[:,-2:]
+        return [in_xy,in_xz,in_yz]
+
+    def forward(self, x):
+        # x is 3D point position: B x 3
+        x_sep = self.separate_input(x)
+        x_embedded_all = []
+        
+        #resolution = torch.floor(self.base_resolution * self.b**i)
+        resolution = self.finest_resolution
+        voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices = get_plane_vertices(\
+                                            x, self.bounding_box, \
+                                            resolution, self.log2_hashmap_size) #[3*(B, 2)]  [3*(B, 2)]  [3*(B, 4)]
+        
+        for j in range(3):
+            voxel_embedds = self.embeddings[j](hashed_voxel_indices[j])     # (B, 4, 2)
+            x_embedded = self.bilinear_interp(x_sep[j], voxel_min_vertex[j], voxel_max_vertex[j], voxel_embedds)
+            # (B, 2)
+            x_embedded_all.append(x_embedded)
+
+            #pdb.set_trace()
+        return torch.cat(x_embedded_all, dim=-1)
 
 class SHEncoder(nn.Module):
     def __init__(self, input_dim=3, degree=4):

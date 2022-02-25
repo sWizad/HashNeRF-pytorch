@@ -1,0 +1,17 @@
+expname = my_test
+basedir = ./logs
+datadir = ./data/geofree/room1
+int_img = ./example/room1.jpg
+dataset_type = geofree
+
+factor = 8
+llffhold = 8
+
+N_rand = 1024
+N_samples = 64
+N_importance = 64
+i_video = 1000
+
+use_viewdirs = False
+raw_noise_std = 1e0
+sparse-loss-weight = 1e-10

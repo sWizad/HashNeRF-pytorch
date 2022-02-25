@@ -20,18 +20,207 @@ from optimizer import MultiOptimizer
 from radam import RAdam
 from loss import sigma_sparsity_loss, total_variation_loss
 
-from load_llff import load_llff_data
+from load_llff import load_llff_data, recenter_poses, poses_avg, render_path_spiral, normalize
 from load_deepvoxels import load_dv_data
-from load_blender import load_blender_data
+from load_blender import load_blender_data, pose_spherical_edited
 from load_LINEMOD import load_LINEMOD_data
 
 from tensorboardX import SummaryWriter
+#geofree
+from PIL import Image
+from splatting import splatting_function
+from torchvision.utils import save_image
+from torch.utils.data.dataloader import default_collate
+sys.path.append(os.path.abspath(os.path.join('../..', 'geometry-free-view-synthesis')))
+from geofree import pretrained_models
+
+from utils import get_bbox3d_for_llff
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
 
+def load_as_example(path): 
+    size = [208, 368]
+    im = Image.open(path)
+    w,h = im.size
+    if np.abs(w/h - size[1]/size[0]) > 0.1:
+        print(f"Center cropping {path} to AR {size[1]/size[0]}")
+        if w/h < size[1]/size[0]:
+            # crop h
+            left = 0
+            right = w
+            top = h/2 - size[0]/size[1]*w/2
+            bottom = h/2 + size[0]/size[1]*w/2
+        else:
+            # crop w
+            top = 0
+            bottom = h
+            left = w/2 - size[1]/size[0]*h
+            right = w/2 + size[1]/size[0]*h
+        im = im.crop(box=(left, top, right, bottom))
+
+    im = im.resize((size[1],size[0]),
+                   resample=Image.LANCZOS)
+    im = np.array(im)#/127.5-1.0
+    im = im.astype(np.float32)
+
+    example = dict()
+    example["src_img0"] = im
+    example["src_img"] = im/127.5-1.0
+    example["K"] = np.array([[184.0, 0.0, 184.0],
+                             [0.0, 184.0, 104.0],
+                             [0.0, 0.0, 1.0]], dtype=np.float32)
+    example["K_inv"] = np.linalg.inv(example["K"])
+
+    ## dummy data not used during inference
+    example["dst_img"] = np.zeros_like(example["src_img"])
+    example["src_points"] = np.zeros((1,3), dtype=np.float32)
+
+    return example
+
+def pose2Rt(pose):
+    new_pose = np.eye(4)
+    new_pose[:3,:] = pose.cpu().numpy()
+    new_pose = np.array([[-1,0,0,0],[0,0,1,0],[0,1,0,0],[0,0,0,1]]) @ new_pose
+    R = new_pose[:3,:3]
+    t = new_pose[:3,3:4]
+    t = t * np.array([[1],[-1],[-1]])
+    t = - (R) @ t
+    #t = t * np.array([[1],[-1],[-1]])
+    #t =  (R) @ t
+    R = torch.tensor(R,dtype=torch.float32)
+    t = torch.tensor(t[:,0],dtype=torch.float32)
+    #print(R.shape,t.shape)
+    return R, t
+
+def render_forward(src_ims, src_dms,
+                   Rcam, tcam,
+                   K_src,
+                   K_dst):
+    Rcam = Rcam.to(device=src_ims.device)[None]
+    tcam = tcam.to(device=src_ims.device)[None]
+
+    R = Rcam
+    t = tcam[...,None]
+    K_src_inv = K_src.inverse()
+
+    assert len(src_ims.shape) == 4
+    assert len(src_dms.shape) == 3
+    assert src_ims.shape[1:3] == src_dms.shape[1:3], (src_ims.shape,
+                                                      src_dms.shape)
+
+    x = np.arange(src_ims[0].shape[1])
+    y = np.arange(src_ims[0].shape[0])
+    coord = np.stack(np.meshgrid(x,y), -1)
+    coord = np.concatenate((coord, np.ones_like(coord)[:,:,[0]]), -1) # z=1
+    coord = coord.astype(np.float32)
+    coord = torch.as_tensor(coord, dtype=K_src.dtype, device=K_src.device)
+    coord = coord[None] # bs, h, w, 3
+
+    D = src_dms[:,:,:,None,None]
+
+    points = K_dst[None,None,None,...]@(R[:,None,None,...]@(D*K_src_inv[None,None,None,...]@coord[:,:,:,:,None])+t[:,None,None,:,:])
+    points = points.squeeze(-1)
+
+    new_z = points[:,:,:,[2]].clone().permute(0,3,1,2) # b,1,h,w
+    points = points/torch.clamp(points[:,:,:,[2]], 1e-8, None)
+
+    src_ims = src_ims.permute(0,3,1,2)
+    flow = points - coord
+    flow = flow.permute(0,3,1,2)[:,:2,...]
+
+    alpha = 0.5
+    importance = alpha/new_z
+    importance_min = importance.amin((1,2,3),keepdim=True)
+    importance_max = importance.amax((1,2,3),keepdim=True)
+    importance=(importance-importance_min)/(importance_max-importance_min+1e-6)*10-10
+    importance = importance.exp()
+
+    input_data = torch.cat([importance*src_ims, importance], 1)
+    output_data = splatting_function("summation", input_data, flow)
+
+    num = torch.sum(output_data[:,:-1,:,:], dim=0, keepdim=True)
+    nom = torch.sum(output_data[:,-1:,:,:], dim=0, keepdim=True)
+
+    rendered = num/(nom+1e-7)
+    rendered = rendered.permute(0,2,3,1)[0,...]
+    return rendered
+
+class Renderer(object):
+    def __init__(self, model, device):
+        self.model = pretrained_models(model=model)
+        self.model = self.model.to(device=device)
+        self._active = False
+
+    def init(self,
+             start_im,
+             example,
+             show_R,
+             show_t):
+        self._active = True
+        self.step = 0
+
+        batch = self.batch = default_collate([example])
+        batch["R_rel"] = show_R[None,...]
+        batch["t_rel"] = show_t[None,...]
+
+        _, cdict, edict = self.model.get_xce(batch)
+        for k in cdict:
+            cdict[k] = cdict[k].to(device=self.model.device)
+        for k in edict:
+            edict[k] = edict[k].to(device=self.model.device)
+
+        quant_d, quant_c, dc_indices, embeddings = self.model.get_normalized_c(cdict,edict,fixed_scale=True)
+
+        start_im = start_im[None,...].to(self.model.device).permute(0,3,1,2)
+        quant_c, c_indices = self.model.encode_to_c(c=start_im)
+        cond_rec = self.model.cond_stage_model.decode(quant_c)
+
+        self.current_im = cond_rec.permute(0,2,3,1)[0]
+        self.current_sample = c_indices
+
+        self.quant_c = quant_c # to know shape
+        # for sampling
+        self.dc_indices = dc_indices
+        self.embeddings = embeddings
+
+    def __call__(self):
+        if self.step < self.current_sample.shape[1]:
+            z_start_indices = self.current_sample[:, :self.step]
+            temperature=None
+            top_k=250
+            callback=None
+            index_sample = self.model.sample(z_start_indices, self.dc_indices,
+                                             steps=1,
+                                             temperature=temperature if temperature is not None else 1.0,
+                                             sample=True,
+                                             top_k=top_k if top_k is not None else 100,
+                                             callback=callback if callback is not None else lambda k: None,
+                                             embeddings=self.embeddings)
+            self.current_sample = torch.cat((index_sample,
+                                             self.current_sample[:,self.step+1:]),
+                                            dim=1)
+
+            sample_dec = self.model.decode_to_img(self.current_sample,
+                                                  self.quant_c.shape)
+            self.current_im = sample_dec.permute(0,2,3,1)[0]
+            self.step += 1
+
+        if self.step >= self.current_sample.shape[1]:
+            self._active = False
+
+        return self.current_im
+
+    def active(self):
+        return self._active
+
+    def reconstruct(self, x):
+        x = x.to(self.model.device).permute(0,3,1,2)
+        quant_c, c_indices = self.model.encode_to_c(c=x)
+        x_rec = self.model.cond_stage_model.decode(quant_c)
+        return x_rec.permute(0,2,3,1)
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
@@ -175,6 +364,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             #print(p)
             psnrs.append(p)
         
+        
 
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
@@ -194,12 +384,9 @@ def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
     embed_fn, input_ch = get_embedder(args.multires, args, i=args.i_embed)
-    if args.i_embed in [1,3] :
+    if args.i_embed==1:
         # hashed embedding table
         embedding_params = list(embed_fn.parameters())
-        #for emb in embedding_params:
-        #    print(emb.shape)
-        #exit()
 
     input_ch_views = 0
     embeddirs_fn = None
@@ -210,7 +397,7 @@ def create_nerf(args):
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
     
-    if args.i_embed in [1,3]:
+    if args.i_embed==1:
         model = NeRFSmall(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
@@ -229,7 +416,7 @@ def create_nerf(args):
     #     args.N_importance = 0
 
     if args.N_importance > 0:
-        if args.i_embed in [1,3]:
+        if args.i_embed==1:
             model_fine = NeRFSmall(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
@@ -248,7 +435,7 @@ def create_nerf(args):
                                                                 netchunk=args.netchunk)
 
     # Create optimizer
-    if args.i_embed in [1,3]:
+    if args.i_embed==1:
         # sparse_opt = torch.optim.SparseAdam(embedding_params, lr=args.lrate, betas=(0.9, 0.99), eps=1e-15)
         # dense_opt = torch.optim.Adam(grad_vars, lr=args.lrate, betas=(0.9, 0.99), weight_decay=1e-6)
         # optimizer = MultiOptimizer(optimizers={"sparse_opt": sparse_opt, "dense_opt": dense_opt})
@@ -284,7 +471,7 @@ def create_nerf(args):
         model.load_state_dict(ckpt['network_fn_state_dict'])
         if model_fine is not None:
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
-        if args.i_embed in [1,3]:
+        if args.i_embed==1:
             embed_fn.load_state_dict(ckpt['embed_fn_state_dict'])
 
     ##########################
@@ -494,6 +681,8 @@ def config_parser():
                         help='where to store ckpts and logs')
     parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
                         help='input data directory')
+    parser.add_argument("--int_img", type=str, default="", 
+                        help='initial img ')
 
     # training options
     parser.add_argument("--netdepth", type=int, default=8, 
@@ -617,6 +806,36 @@ def train():
         os.system("rm -rf "+writerpath)
     writer = SummaryWriter(writerpath)
 
+    # Create log dir and copy the config file
+    basedir = args.basedir
+    if args.i_embed==1:
+        args.expname += "_hashXYZ"
+    elif args.i_embed==0:
+        args.expname += "_posXYZ"
+    if args.i_embed_views==2:
+        args.expname += "_sphereVIEW"
+    elif args.i_embed_views==0:
+        args.expname += "_posVIEW"
+    args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
+    args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
+    args.expname += "_RAdam"
+    if args.sparse_loss_weight > 0:
+        args.expname += "_sparse" + str(args.sparse_loss_weight)
+    args.expname += "_TV" + str(args.tv_loss_weight)
+    #args.expname += datetime.now().strftime('_%H_%M_%d_%m_%Y')
+    expname = args.expname   
+ 
+    os.makedirs(os.path.join(basedir, expname), exist_ok=True)
+    f = os.path.join(basedir, expname, 'args.txt')
+    with open(f, 'w') as file:
+        for arg in sorted(vars(args)):
+            attr = getattr(args, arg)
+            file.write('{} = {}\n'.format(arg, attr))
+    if args.config is not None:
+        f = os.path.join(basedir, expname, 'config.txt')
+        with open(f, 'w') as file:
+            file.write(open(args.config, 'r').read())
+
     # Load data
     K = None
     if args.dataset_type == 'llff':
@@ -687,10 +906,161 @@ def train():
         near = hemi_R-1.
         far = hemi_R+1.
 
+    elif args.dataset_type == 'geofree':
+        fopath = os.path.join(basedir, expname)
+        trainpath = os.path.join(fopath, "train")
+        if os.path.exists(trainpath):
+            # load img
+            poses = np.load(os.path.join(fopath,"poses.npy"))
+            imgfiles = [os.path.join(trainpath, f) for f in sorted(os.listdir(trainpath)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+
+            def imread(f):
+                if f.endswith('png'):
+                    return imageio.imread(f, ignoregamma=True)
+                else:
+                    return imageio.imread(f)
+                
+            imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
+            imgs = np.stack(imgs, -1)  
+            images = np.moveaxis(imgs, -1, 0).astype(np.float32)
+            K   = np.array([[184.0, 0.0, 184.0],
+                             [0.0, 184.0, 104.0],
+                             [0.0, 0.0, 1.0]], dtype=np.float32)
+            #print(imgs.shape)
+            #exit()
+        else:
+            if os.path.exists(trainpath):
+                os.system("rm -rf "+trainpath)
+            os.makedirs(trainpath)
+            #load midas
+            midas = torch.hub.load("intel-isl/MiDaS", "MiDaS")
+            midas.to(device)
+            midas.eval()
+            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+            transform = midas_transforms.dpt_transform
+            renderer = Renderer(model="re_impl_depth", device="cuda")
+
+            #load 1 img
+            example = load_as_example( args.int_img )
+            img = example["src_img0"]#[None,...]
+            input_batch = transform(img).to("cuda")
+            # find depth img
+            with torch.no_grad():
+                prediction = midas(input_batch)
+                #prediction = midas.fixed_scale_depth(midas_in, return_inverse_depth=True)
+                #prediction = 1.0/
+                prediction = prediction.clamp(min=1e-8)
+
+                prediction = torch.nn.functional.interpolate(
+                    prediction.unsqueeze(1),
+                    size=img.shape[:2],
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze(1)
+
+                scale=[0.18577382, 0.93059154]
+                dmmin = prediction.amin(dim=(1,2), keepdim=True)
+                dmmax = prediction.amax(dim=(1,2), keepdim=True)
+                scaled_dm = (prediction-dmmin)/(dmmax-dmmin)*(scale[1]-scale[0])+scale[0]
+                dms = 1.0/scaled_dm#[0]#.cpu().numpy()
+
+            del midas, transform, midas_transforms
+            torch.cuda.empty_cache()
+            dms = dms*0+1
+
+            
+            K = example["K"]
+            K = torch.tensor(K, dtype=torch.float32).to(device=device)
+            src_ims = torch.tensor(img, dtype=torch.float32)/127.5-1
+            src_ims = src_ims[None].to(device)
+            thetarange = [0, 10, -10, 20, -20]
+            phirange = [0]
+            poses, images = [], []
+            for i0,theta in enumerate(thetarange):
+                for i1,phi in enumerate(phirange):
+                    # find pose img
+                    pose = pose_spherical_edited(theta,phi,1)
+                    pose = pose[:3, :4]
+                    show_R, show_t = pose2Rt(pose)
+                    poses.append(pose[None].cpu().numpy())
+
+                    ### Warp image ###
+                    wrp_im = render_forward(src_ims, dms,
+                                            show_R, show_t,
+                                            K_src=K,
+                                            K_dst=K)
+                    #save_image((wrp_im.permute(2,0,1)+1)/2,os.path.join(trainpath,"warp.png"))
+                    ### Fixed image ###
+                    if theta==0 and phi ==0: rec_ims = wrp_im  #TODO need to be src_img
+                    else:
+                        with torch.no_grad():
+                            renderer.init(wrp_im, example, show_R, show_t)
+                            for i in tqdm(range(1)):
+                                #if i%10==0: print(i)
+                                rec_ims = renderer()
+                    images.append((rec_ims[None].cpu().numpy()+1)/2)
+                    save_image((rec_ims.permute(2,0,1)+1)/2,os.path.join(trainpath,"r_{:02d}{:02d}.png".format(i0,i1)))
+            
+            del renderer
+            torch.cuda.empty_cache()
+
+            #poses = torch.cat(poses,0)
+            poses = np.concatenate(poses,0)
+            np.save(os.path.join(fopath,"poses.npy"),poses)
+            images = np.concatenate(images,0)
+        hwf = [208, 368, 184]
+        near = 0.5
+        far = 5.5
+        if False: #TODO fix this
+            render_poses = recenter_poses(poses) 
+        else:
+            c2w = poses_avg(poses)
+            #print('recentered', c2w.shape)
+            #print(c2w[:3,:4])
+
+            ## Get spiral
+            # Get average pose
+            up = normalize(poses[:, :3, 1].sum(0))
+
+            # Find a reasonable "focus depth" for this dataset
+            #close_depth, inf_depth = bds.min()*.9, bds.max()*5.
+            close_depth, inf_depth = 0.5*.9, 5.5*5.
+            dt = .75
+            mean_dz = 1./(((1.-dt)/close_depth + dt/inf_depth))
+            focal = mean_dz
+
+            # Get radii for spiral path
+            shrink_factor = .8
+            zdelta = close_depth * .2
+            tt = poses[:,:3,3] # ptstocam(poses[:3,3,:].T, c2w).T
+            rads = np.percentile(np.abs(tt), 90, 0)
+            c2w_path = c2w
+            N_views = 60
+            N_rots = 1
+            if False:
+                #zloc = np.percentile(tt, 10, 0)[2]
+                zloc = -close_depth * .1
+                c2w_path[:3,3] = c2w_path[:3,3] + zloc * c2w_path[:3,2]
+                rads[2] = 0.
+                N_rots = 1
+                N_views/=2
+            # Generate poses for spiral path
+            render_poses = render_path_spiral(c2w_path, up, rads, focal, zdelta, zrate=.5, rots=N_rots, N=N_views)
+        render_poses = np.array(render_poses).astype(np.float32)
+        i_train = np.array([i for i in np.arange(int(images.shape[0])) ])
+        i_test = [1,2,3,4]
+        i_val = i_test
+        bounding_box = get_bbox3d_for_llff(poses, hwf, near, far) #TODO This is bugy.
+        box_min, box_max = bounding_box
+        mmax = max(-torch.min(box_min).item(),torch.max(box_max).item())
+        box_min, box_max = -mmax*torch.ones_like(box_min), mmax*torch.ones_like(box_min)
+        bounding_box = [box_min, box_max]
+        args.bounding_box = bounding_box
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
-
+    
+    #print("images",images.shape)
     # Cast intrinsics to right types
     H, W, focal = hwf
     H, W = int(H), int(W)
@@ -702,41 +1072,12 @@ def train():
             [0, focal, 0.5*H],
             [0, 0, 1]
         ])
+    elif torch.is_tensor(K):
+        K = K.cpu().numpy()
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
 
-    # Create log dir and copy the config file
-    basedir = args.basedir
-    if args.i_embed==1:
-        args.expname += "_hashXYZ"
-    elif args.i_embed==3:
-        args.expname += "_newhashXYZ"
-    elif args.i_embed==0:
-        args.expname += "_posXYZ"
-    if args.i_embed_views==2:
-        args.expname += "_sphereVIEW"
-    elif args.i_embed_views==0:
-        args.expname += "_posVIEW"
-    args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
-    args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
-    args.expname += "_RAdam"
-    if args.sparse_loss_weight > 0:
-        args.expname += "_sparse" + str(args.sparse_loss_weight)
-    args.expname += "_TV" + str(args.tv_loss_weight)
-    #args.expname += datetime.now().strftime('_%H_%M_%d_%m_%Y')
-    expname = args.expname   
- 
-    os.makedirs(os.path.join(basedir, expname), exist_ok=True)
-    f = os.path.join(basedir, expname, 'args.txt')
-    with open(f, 'w') as file:
-        for arg in sorted(vars(args)):
-            attr = getattr(args, arg)
-            file.write('{} = {}\n'.format(arg, attr))
-    if args.config is not None:
-        f = os.path.join(basedir, expname, 'config.txt')
-        with open(f, 'w') as file:
-            file.write(open(args.config, 'r').read())
 
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
@@ -880,7 +1221,7 @@ def train():
         loss = loss + sparsity_loss
        
         # add Total Variation loss
-        if args.i_embed in [1, 3] and False:
+        if args.i_embed==1:
             n_levels = render_kwargs_train["embed_fn"].n_levels
             min_res = render_kwargs_train["embed_fn"].base_resolution
             max_res = render_kwargs_train["embed_fn"].finest_resolution
@@ -913,7 +1254,7 @@ def train():
         # Rest is logging
         if i%args.i_weights==0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
-            if args.i_embed in [1, 3]:
+            if args.i_embed==1:
                 torch.save({
                     'global_step': global_step,
                     'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
@@ -951,19 +1292,21 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                rgbs, disps = render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
         if i%100 ==0 and i>0:
             with torch.no_grad():
                 rgb, disp, acc, _ = render(H, W, K, chunk=args.chunk, c2w=poses[0,:3,:4], **render_kwargs_test)
                 writer.add_image('train_ctr/rgb', rgb.permute(2,0,1), i)
+
+
     
         if i%args.i_print==0:
             writer.add_scalar("Loss",loss,i)
             writer.add_scalar("PSNR",psnr,i)
             writer.add_scalar("sparsity_loss",sparsity_loss,i)
-            #writer.add_scalar("TV_loss",TV_loss,i)
+            writer.add_scalar("TV_loss",TV_loss,i)
             #writer.add_image("rbg",extras['rgb0'],i)
             #writer.add_image("gt",target_s,i)
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
